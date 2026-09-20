@@ -73,10 +73,11 @@ class Repo:
         return path
 
     def run(self, base: str, head: str, directory: str = ".residue",
-            config: str = "disensor.config.json") -> int:
+            config: str = "disensor.config.json", report: bool = True,
+            report_out: str | None = None) -> int:
         return run_gate(
             directory=directory, config_path=config, base=base, head=head,
-            repo_dir=self.path, post=False,
+            repo_dir=self.path, post=False, report=report, report_out=report_out,
         )
 
 
@@ -708,3 +709,130 @@ def test_repairing_the_invalid_policy_is_an_administrative_step(repo, capsys):
     head = repo.commit("intenta repararla")
     assert repo.run(base, head) != 0
     assert "administrative step" in out(capsys)
+
+
+# --- the degraded mode v0.4 made declarable has to survive the comment --------
+
+def test_a_declaration_with_the_reviewer_classes_of_v04_passes_the_gate(repo, capsys):
+    """#56: validaba bien y el gate moría con KeyError al armar el comentario,
+    también sin publicarlo, porque el cuerpo se renderiza antes de decidir."""
+    repo.write("src/app.py", "code")
+    code_commit = repo.commit("feat")
+    path = repo.artifact("diff", head=code_commit, base=repo.git("rev-parse", "HEAD~1"))
+    a = json.loads((repo.path / path).read_text(encoding="utf-8"))
+    r = a["actors"]["reviewers"][0]
+    r["family"] = a["actors"]["generator"]["family"]
+    r["model"] = a["actors"]["generator"]["model"]
+    r["independence"] = "same_model_fresh_context"
+    r["fallback_reason"] = {"code": "no_other_family_available"}
+    r["hardening"] = "unverified"
+    a["residue"]["items"] += [
+        {"id": "r4", "class": "reviewer_correlation", "reviewer_ref": r["reviewer_id"],
+         "requires_human_attention": True,
+         "description": ("El revisor comparte modelo con el generador: los errores que ese "
+                         "modelo comete de forma sistemática no los cubrió esta ronda.")},
+        {"id": "r5", "class": "reviewer_hardening_gap", "reviewer_ref": r["reviewer_id"],
+         "requires_human_attention": True,
+         "description": ("El adaptador no tiene verificada la neutralización de las "
+                         "instrucciones del proyecto: el material revisado pudo hablarle "
+                         "al revisor.")},
+    ]
+    repo.write(path, json.dumps(a, ensure_ascii=False))
+    head = repo.commit("docs(residue)")
+    assert repo.run(repo.git("rev-parse", "HEAD~2"), head) == 0
+    printed = out(capsys)
+    assert "(reviewer r1)" in printed, printed
+
+
+# --- the document is the last thing of an event ---------------------------------
+
+def declared_pr(repo) -> tuple[str, str]:
+    """A PR with code and its declaration committed: base and head of the range."""
+    repo.write("src/app.py", "code")
+    code_commit = repo.commit("feat")
+    repo.artifact("diff", head=code_commit, base=repo.git("rev-parse", "HEAD~1"))
+    head = repo.commit("docs(residue)")
+    return repo.git("rev-parse", "HEAD~2"), head
+
+
+def test_a_green_gate_writes_the_report_from_the_judged_head(repo, capsys):
+    """Read from the git objects at head, never from the tree: an untracked file
+    dropped in .residue/ after the commit does not appear."""
+    repo.write(".gitignore", "informe-residuo.html\n")
+    repo.commit("ignora el informe")
+    base, head = declared_pr(repo)
+    repo.write(".residue/sin-commitear.json", json.dumps(DIFF))
+    assert repo.run(base, head) == 0
+    lines = out(capsys).strip().splitlines()
+    assert lines[-1].startswith("[gate] report: 1 declaration,"), lines[-1]
+    assert lines[-1].endswith(str(repo.path / "informe-residuo.html"))
+    page = (repo.path / "informe-residuo.html").read_text(encoding="utf-8")
+    assert f"en el commit <code>{head[:7]}</code>" in page
+    assert "sin-commitear.json" not in page
+    assert repo.git("status", "--porcelain", "--", "informe-residuo.html") == ""
+
+
+def test_without_the_gitignore_entry_the_report_is_not_written_and_says_so(repo, capsys):
+    base, head = declared_pr(repo)
+    assert repo.run(base, head) == 0
+    assert not (repo.path / "informe-residuo.html").exists()
+    last = out(capsys).strip().splitlines()[-1]
+    assert last.startswith("[gate] report:") and "not ignored by git" in last
+
+
+def test_no_report_writes_nothing_and_says_nothing(repo, capsys):
+    repo.write(".gitignore", "informe-residuo.html\n")
+    repo.commit("ignora el informe")
+    base, head = declared_pr(repo)
+    assert repo.run(base, head, report=False) == 0
+    assert not (repo.path / "informe-residuo.html").exists()
+    assert "[gate] report:" not in out(capsys)
+
+
+def test_report_out_writes_where_it_is_told_without_the_ignore_guard(repo, tmp_path_factory, capsys):
+    base, head = declared_pr(repo)
+    destination = tmp_path_factory.mktemp("informe") / "residuo.html"
+    assert repo.run(base, head, report_out=str(destination)) == 0
+    assert destination.exists()
+    assert out(capsys).strip().splitlines()[-1].endswith(str(destination))
+
+
+def test_report_out_inside_the_evidence_directory_is_refused(repo, capsys):
+    base, head = declared_pr(repo)
+    assert repo.run(base, head, report_out=".residue/informe.html") == 0
+    assert list((repo.path / ".residue").glob("*.html")) == []
+    assert "inside the evidence directory" in out(capsys).strip().splitlines()[-1]
+
+
+def test_a_red_gate_writes_no_report(repo, capsys):
+    repo.write(".gitignore", "informe-residuo.html\n")
+    repo.commit("ignora el informe")
+    repo.write("src/app.py", "code")
+    head = repo.commit("feat sin declaracion")
+    assert repo.run(repo.git("rev-parse", "HEAD~1"), head) == 1
+    assert not (repo.path / "informe-residuo.html").exists()
+    assert "[gate] report:" not in out(capsys)
+
+
+def test_a_failing_report_is_loud_and_leaves_the_verdict_alone(repo, capsys, monkeypatch):
+    """Best effort, never silent: the exit code is the gate's, the failure is
+    the last line of the output."""
+    repo.write(".gitignore", "informe-residuo.html\n")
+    repo.commit("ignora el informe")
+    base, head = declared_pr(repo)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("template missing from the package")
+
+    monkeypatch.setattr("disensor.report.build_html", explode)
+    assert repo.run(base, head) == 0
+    last = out(capsys).strip().splitlines()[-1]
+    assert last.startswith("[gate] report: FAILED: RuntimeError: template missing"), last
+    assert not (repo.path / "informe-residuo.html").exists()
+
+
+def test_report_out_on_a_file_git_tracks_is_refused(repo, capsys):
+    base, head = declared_pr(repo)
+    assert repo.run(base, head, report_out="README.md") == 0
+    assert (repo.path / "README.md").read_text(encoding="utf-8") == "start"
+    assert "git tracks" in out(capsys).strip().splitlines()[-1]
