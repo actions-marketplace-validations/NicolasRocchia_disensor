@@ -38,7 +38,7 @@ from .pin import PinError, pin_text, resolve_tag_commit
 # se queda con el procedimiento viejo para siempre, porque init conserva byte
 # por byte lo que ya existe y actualizar el paquete no cambia lo que el agente
 # lee. Con la marca, --upgrade sabe que reemplazar y que dejar quieto.
-BLOCK_VERSION = "0.9"
+BLOCK_VERSION = "0.11"
 
 CLAUDE_HEADING = "## disensor: residue declaration at event close"
 
@@ -51,9 +51,11 @@ means and when to stop and ask, is the disensor skill
 (`.claude/skills/disensor/SKILL.md`); any other agent gets the same text from
 `disensor guide`, which prints the runbook and the filling guide.
 
-Two rules that do not depend on remembering the rest: the material is never
-pasted between models by hand, and a tree that changed during a round is not
-declared, it is reported.
+Three rules that do not depend on remembering the rest: the material is never
+pasted between models by hand; a tree that changed during a round is not
+declared, it is reported; and the consent to send the material out of this
+machine is the owner's to give, so you never run `disensor reviewer consent`
+yourself.
 
 <!-- disensor:block v{BLOCK_VERSION} -->
 """
@@ -102,7 +104,11 @@ Read the exit code, do not guess from the text:
   a shortcut, not the list of what is allowed: ANY assistant with a command
   line can review, whatever the vendor. Look at what this machine actually has,
   read its `--help`, and register it. An entry outside the catalogue needs the
-  OWNER to approve it, so ask; do not approve it yourself.
+  OWNER to approve it, so ask; do not approve it yourself. If the round says
+  the material of this repository was not authorised, stop there too: the
+  consent to send it out of this machine is the OWNER's, given with
+  `disensor reviewer consent <id>`. Never run that command yourself, not even
+  after the owner approved the round in the chat: ask them to run it.
 - `5`: the tree changed during the round. Do NOT declare. Tell the user what
   appeared: a reviewer that writes is not a reviewer that only reads.
 - `6`: could not decide whether a round was needed. Stop and report. This is
@@ -151,6 +157,8 @@ arbiter reads.
 - A risk that somebody has to accept (`owner_decision`).
 - A finding escalated without resolution (`escalated_open`).
 - No reviewer available, or an entry that needs approval.
+- The consent to send the material to a reviewer is missing: the owner gives
+  it, never you.
 - The tree changed during a round.
 
 <!-- disensor:block v{BLOCK_VERSION} -->
@@ -190,6 +198,22 @@ def _is_git_repo(cwd: Path) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+# Todo lo que init escribe va en bytes, como `_write_gitignore` y el pin (#82).
+# El modo texto convierte CRLF en LF al leer y, en Windows, cada LF en CRLF al
+# escribir: un CLAUDE.md en LF al que init le agregaba su seccion volvia entero
+# en CRLF, lineas ajenas incluidas, y `--upgrade` lo repetia en cada
+# actualizacion. Un archivo nuevo va en LF; en uno que ya existe, lo que init
+# agrega toma el final de linea que el archivo ya usa, y lo demas no se toca.
+def _read_as_is(path: Path) -> tuple[str, str]:
+    """The text as it is on disk, and the line ending it uses."""
+    text = path.read_bytes().decode("utf-8")
+    return text, "\r\n" if "\r\n" in text else "\n"
+
+
+def _write(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8"))
+
+
 def _write_config(root: Path, level: str, report: list[str]) -> None:
     path = root / "disensor.config.json"
     if path.exists():
@@ -207,22 +231,23 @@ def _write_config(root: Path, level: str, report: list[str]) -> None:
             report.append(f"kept    {path.name} (already exists)")
         return
     config = {"criticality_level": level, "level_A_enabled": False}
-    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    _write(path, json.dumps(config, indent=2) + "\n")
     report.append(f"created {path.name} (criticality_level={level})")
 
 
 def _write_claude(path: Path, section: str, label: str, report: list[str]) -> None:
     if path.exists():
-        content = path.read_text(encoding="utf-8")
+        content, newline = _read_as_is(path)
         if CLAUDE_HEADING in content:
             report.append(f"kept    {label} (disensor section already present)")
             return
-        joiner = "" if content.endswith("\n\n") else ("\n" if content.endswith("\n") else "\n\n")
-        path.write_text(content + joiner + section, encoding="utf-8")
+        plain = content.replace("\r\n", "\n")
+        joiner = "" if plain.endswith("\n\n") else ("\n" if plain.endswith("\n") else "\n\n")
+        _write(path, content + (joiner + section).replace("\n", newline))
         report.append(f"updated {label} (disensor section appended)")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(section, encoding="utf-8")
+    _write(path, section)
     report.append(f"created {label}")
 
 
@@ -232,7 +257,7 @@ def _write_skill(base: Path, label: str, report: list[str]) -> None:
         report.append(f"kept    {label} (already exists)")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(SKILL_FRONTMATTER + RUNBOOK, encoding="utf-8")
+    _write(path, SKILL_FRONTMATTER + RUNBOOK)
     report.append(f"created {label}")
 
 
@@ -270,7 +295,7 @@ def _write_workflow(root: Path, report: list[str]) -> None:
         report.append(f"kept    {rel} (already exists)")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(WORKFLOW, encoding="utf-8")
+    _write(path, WORKFLOW)
     # The README requires pinning by SHA, so the scaffold should not leave the
     # user out of compliance with the tool's own doctrine. Resolution needs
     # network; without it the tag stays and the report says what is missing.
@@ -365,9 +390,19 @@ def main_init(args) -> int:
 # lo que una version conocida escribio, entero. Los finales de linea se
 # normalizan antes de hashear para que CRLF, autocrlf o un formateador no
 # cuenten como una edicion del usuario.
+#
+# La marca de version no alcanza para reconocer: el texto de la seccion de
+# CLAUDE.md cambio en la 0.9.2 sin que la marca dejara de decir v0.9, asi que
+# hay dos bloques "v0.9" en el mundo. Se reconocen los dos por hash, y la skill
+# de 0.9.0 a 0.10.0 tambien. Los textos exactos estan en tests/bloques/.
 KNOWN_BLOCKS = {
     "claude": {
         "efc57db2d88bbc34bc9455b99fdb6e93033cece2d65dc3de99ddc87fedfc2e4d": "0.7",
+        "48e27292f5ee748b8d01cd3e6fad34a44434885a2b080329d7f61f5d1c660d2f": "0.9",  # 0.9.0 y 0.9.1
+        "f019e46fa120f33ba052934a2a3224c986a6168197f810d382b75cf8297f0462": "0.9",  # 0.9.2 a 0.10.0
+    },
+    "skill": {
+        "652619d1d7a5906f13f8f476ec883c6acf4c047b5398640bd8ab06806e06db9a": "0.9",  # 0.9.0 a 0.10.0
     },
 }
 
@@ -388,7 +423,7 @@ def _upgrade_claude(path: Path, section: str, label: str, report: list[str]) -> 
     if not path.exists():
         report.append(f"absent {label} (run init without --upgrade to create it)")
         return 0
-    content = path.read_text(encoding="utf-8")
+    content, newline = _read_as_is(path)
     if CLAUDE_HEADING not in content:
         report.append(f"absent {label} (no disensor section to upgrade)")
         return 0
@@ -411,7 +446,8 @@ def _upgrade_claude(path: Path, section: str, label: str, report: list[str]) -> 
         )
         return UPGRADE_CONFLICT
 
-    path.write_text(content[:inicio] + section.rstrip("\n") + "\n" + content[fin:], encoding="utf-8")
+    nuevo = (section.rstrip("\n") + "\n").replace("\n", newline)
+    _write(path, content[:inicio] + nuevo + content[fin:])
     report.append(f"upgraded {label} (v{version or 'pre-0.8'} -> v{BLOCK_VERSION})")
     return 0
 
@@ -427,10 +463,9 @@ def _known_claude_block(actual: str, version: str | None) -> str | None:
 
     A single line added by the user makes the hash differ, and then nothing is
     touched. That is the intended outcome: the safe answer to "I am not sure
-    whose text this is" is to leave it alone and say so.
+    whose text this is" is to leave it alone and say so. The marker says which
+    version wrote the block; only the hash says that nobody edited it since.
     """
-    if version is not None:
-        return None  # una version marcada que no es la actual: no conocemos su texto exacto
     return actual if _block_hash(actual) in KNOWN_BLOCKS["claude"] else None
 
 
@@ -477,19 +512,24 @@ def _upgrade_skill(root: Path, report: list[str]) -> int:
     if not path.exists():
         report.append("absent .claude/skills/disensor/SKILL.md")
         return 0
-    actual = path.read_text(encoding="utf-8")
-    if _managed_version(actual) == BLOCK_VERSION:
+    actual, newline = _read_as_is(path)
+    version = _managed_version(actual)
+    if version == BLOCK_VERSION:
         report.append(f"current .claude/skills/disensor/SKILL.md (block v{BLOCK_VERSION})")
         return 0
+    if _block_hash(actual) in KNOWN_BLOCKS["skill"]:
+        origen = f"runbook v{version}"
     # La skill de 0.7 era la guia de llenado entera, reconocible por su titulo.
-    if guide_text().split("\n", 1)[0] not in actual:
+    elif version is None and guide_text().split("\n", 1)[0] in actual:
+        origen = "guide"
+    else:
         report.append(
             "CONFLICT .claude/skills/disensor/SKILL.md: it was edited, or comes from a version "
             "this disensor does not recognise. Nothing was touched"
         )
         return UPGRADE_CONFLICT
-    path.write_text(SKILL_FRONTMATTER + RUNBOOK, encoding="utf-8")
-    report.append(f"upgraded .claude/skills/disensor/SKILL.md (guide -> runbook v{BLOCK_VERSION})")
+    _write(path, (SKILL_FRONTMATTER + RUNBOOK).replace("\n", newline))
+    report.append(f"upgraded .claude/skills/disensor/SKILL.md ({origen} -> runbook v{BLOCK_VERSION})")
     return 0
 
 
